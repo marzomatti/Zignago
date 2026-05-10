@@ -10,6 +10,9 @@
     "model_selection_metric": "auprc",
     "freeze_backbone_epochs": 2,
     "early_stopping_patience": 5,
+    "sample_level": "group",
+    "group_view_suffixes": "26_2_C.bmp,28_2_C.bmp,80_2_C.bmp",
+    "group_aggregation": "concat",
     "output_dir": "output/experiments"
   },
   "experiments": [
@@ -20,38 +23,6 @@
       },
       "grid": {
         "learning_rate": [0.0001, 0.0003, 0.001]
-      }
-    },
-    {
-      "name": "efficientnet_resolution",
-      "args": {
-        "model": "efficientnet_b0",
-        "learning_rate": 0.0003
-      },
-      "grid": {
-        "image_size": [224, 384, 512],
-        "batch_size": [8, 16]
-      }
-    },
-    {
-      "name": "model_comparison",
-      "args": {
-        "learning_rate": 0.0003,
-        "image_size": 384
-      },
-      "grid": {
-        "model": ["efficientnet_b0", "resnet18", "mobilenet_v3_small"]
-      }
-    },
-    {
-      "name": "imbalance_strategy",
-      "args": {
-        "model": "efficientnet_b0",
-        "learning_rate": 0.0003,
-        "image_size": 384
-      },
-      "grid": {
-        "balance_strategy": ["sampler", "loss", "both"]
       }
     }
   ]

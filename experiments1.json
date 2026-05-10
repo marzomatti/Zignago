@@ -24,22 +24,23 @@
     "fixed_threshold": 0.5,
     "model_selection_metric": "auprc",
     "limit_images_per_class": null,
+    "sample_level": "group",
+    "group_view_suffixes": "26_2_C.bmp,28_2_C.bmp,80_2_C.bmp",
+    "group_aggregation": "concat",
     "no_augment": false,
     "device": "auto",
     "num_workers": 2
   },
   "experiments": [
     {
-      "name": "cropped_images",
+      "name": "grid_search",
       "args": {
         "train_ratio": 0.65,
         "val_ratio": 0.15,
         "test_ratio": 0.20,
         "model": "efficientnet_b0",
-        "learning_rate": 0.0003,
         "epochs": 20,
         "batch_size": 16,
-        "image_size": 384,
         "limit_images_per_class": null,
         "model_selection_metric": "auprc",
         "num_workers": 2,
@@ -48,7 +49,10 @@
         "weight_decay": 0.0001,
         "weights": "imagenet"
       },
-      "grid": {}
+      "grid": {
+        "learning_rate": [0.0003, 0.001, 0.003, 0.01],
+        "image_size": [100,200,300,400,600]
+      }
     }
   ]
 }

@@ -43,6 +43,16 @@ Default training uses EfficientNet-B0 fine tuning with ImageNet weights:
 python src/main.py train
 ```
 
+By default, training is bottle-level: files with the same prefix before the
+first underscore are grouped into one sample. The default grouped views are
+`26_2_C.bmp`, `28_2_C.bmp`, and `80_2_C.bmp`; a shared CNN processes each view,
+then the features are combined for one bottle-level prediction. To go back to
+the older one-image-per-sample behavior:
+
+```bash
+python src/main.py train --sample-level image
+```
+
 ## Remove Black Images
 
 First run the cleanup script in dry-run mode. It scans `data/`, writes CSV
@@ -182,6 +192,9 @@ flags such as `learning_rate` -> `--learning-rate`.
 | `fixed_threshold` | float | `0.5` | Defect probability cutoff when `threshold_policy` is `fixed`; also used during epoch logging. |
 | `model_selection_metric` | `auprc`, `auroc`, `f1`, `balanced_accuracy`, `loss` | `auprc` | Validation metric for choosing `best_model.pt`. `auprc` is recommended for imbalanced defect detection. |
 | `limit_images_per_class` | integer or `null` | `null` | Debug mode: keeps at most N images per class before splitting. Keep `null` for real experiments. |
+| `sample_level` | `group`, `image` | `group` | Training/evaluation unit. `group` creates one sample per bottle prefix; `image` keeps one sample per image. |
+| `group_view_suffixes` | comma-separated suffixes | `26_2_C.bmp,28_2_C.bmp,80_2_C.bmp` | Views that form one bottle sample when `sample_level` is `group`, in fixed order. |
+| `group_aggregation` | `concat`, `mean` | `concat` | How the grouped model combines shared-backbone features from the three views. |
 | `no_augment` | boolean | `false` | When `true`, disables training augmentation. Usually keep `false`. |
 | `device` | `auto`, `mps`, `cuda`, `cpu` | `auto` | Training device. `auto` prefers Apple Silicon MPS, then CUDA, then CPU. |
 | `num_workers` | integer | `2` | DataLoader worker processes. Use `0` if multiprocessing gives trouble. |

@@ -71,6 +71,7 @@ CLASS_TO_IDX = {"good": 0, "defective": 1}
 IDX_TO_CLASS = {value: key for key, value in CLASS_TO_IDX.items()}
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
+DEFAULT_GROUP_VIEW_SUFFIXES = ("26_2_C.bmp", "28_2_C.bmp", "80_2_C.bmp")
 
 
 @dataclass
@@ -100,6 +101,9 @@ class RunConfig:
     augment: bool
     model_selection_metric: str
     limit_images_per_class: Optional[int]
+    sample_level: str
+    group_view_suffixes: str
+    group_aggregation: str
 
 
 class PadToSquare:
@@ -150,6 +154,71 @@ class GlassBottleDataset(Dataset):
         return image, label, str(path)
 
 
+class GroupedBottleDataset(Dataset):
+    def __init__(self, frame: pd.DataFrame, transform: transforms.Compose) -> None:
+        self.path_groups = [
+            [Path(path) for path in json.loads(paths_json)]
+            for paths_json in frame["paths_json"].tolist()
+        ]
+        self.labels = frame["label"].astype(int).tolist()
+        self.identifiers = frame["paths_json"].tolist()
+        self.transform = transform
+
+    def __len__(self) -> int:
+        return len(self.path_groups)
+
+    def __getitem__(self, index: int) -> Tuple[torch.Tensor, torch.Tensor, str]:
+        images = []
+        for path in self.path_groups[index]:
+            with Image.open(path) as image:
+                image = image.convert("RGB")
+                images.append(self.transform(image))
+
+        label = torch.tensor(self.labels[index], dtype=torch.float32)
+        return torch.stack(images), label, self.identifiers[index]
+
+
+class MultiViewClassifier(nn.Module):
+    def __init__(
+        self,
+        backbone: nn.Module,
+        feature_dim: int,
+        num_views: int,
+        aggregation: str,
+        classifier: nn.Module,
+    ) -> None:
+        super().__init__()
+        self.backbone = backbone
+        self.feature_dim = feature_dim
+        self.num_views = num_views
+        self.aggregation = aggregation
+        self.classifier = classifier
+
+    def forward(self, images: torch.Tensor) -> torch.Tensor:
+        if images.ndim != 5:
+            raise ValueError(
+                "Grouped bottle model expects input with shape "
+                "[batch, views, channels, height, width]."
+            )
+
+        batch_size, num_views, channels, height, width = images.shape
+        if num_views != self.num_views:
+            raise ValueError(f"Expected {self.num_views} views, got {num_views}.")
+
+        flat_images = images.reshape(batch_size * num_views, channels, height, width)
+        features = self.backbone(flat_images)
+        features = features.reshape(batch_size, num_views, self.feature_dim)
+
+        if self.aggregation == "concat":
+            features = features.reshape(batch_size, num_views * self.feature_dim)
+        elif self.aggregation == "mean":
+            features = features.mean(dim=1)
+        else:
+            raise ValueError(f"Unknown group aggregation: {self.aggregation}")
+
+        return self.classifier(features)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Train and evaluate a binary glass bottle defect classifier."
@@ -194,6 +263,29 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help="Optional debug mode. Keeps at most N images per class before splitting.",
+    )
+    train.add_argument(
+        "--sample-level",
+        choices=["group", "image"],
+        default="group",
+        help=(
+            "Use one training sample per bottle prefix ('group') or one sample "
+            "per image ('image')."
+        ),
+    )
+    train.add_argument(
+        "--group-view-suffixes",
+        default=",".join(DEFAULT_GROUP_VIEW_SUFFIXES),
+        help=(
+            "Comma-separated filename suffixes that make up a grouped bottle "
+            "sample, in view order."
+        ),
+    )
+    train.add_argument(
+        "--group-aggregation",
+        choices=["concat", "mean"],
+        default="concat",
+        help="How to combine shared-backbone features from grouped bottle views.",
     )
     train.add_argument("--no-augment", action="store_true")
 
@@ -315,6 +407,9 @@ def train_command(args: argparse.Namespace) -> None:
         augment=not args.no_augment,
         model_selection_metric=args.model_selection_metric,
         limit_images_per_class=args.limit_images_per_class,
+        sample_level=args.sample_level,
+        group_view_suffixes=args.group_view_suffixes,
+        group_aggregation=args.group_aggregation,
     )
     write_json(run_dir / "config.json", asdict(config))
 
@@ -327,7 +422,13 @@ def train_command(args: argparse.Namespace) -> None:
     for directory in defect_dirs:
         print(f"  - {directory}")
 
-    frame = scan_dataset(good_dirs, defect_dirs)
+    image_frame = scan_dataset(good_dirs, defect_dirs)
+    view_suffixes = parse_group_view_suffixes(args.group_view_suffixes)
+    if args.sample_level == "group":
+        frame = make_bottle_group_frame(image_frame, view_suffixes)
+    else:
+        frame = image_frame
+
     if args.limit_images_per_class is not None:
         frame = limit_per_class(frame, args.limit_images_per_class, args.seed)
 
@@ -352,9 +453,16 @@ def train_command(args: argparse.Namespace) -> None:
         args.balance_strategy,
         args.seed,
         device,
+        args.sample_level,
     )
 
-    model = build_model(args.model, args.weights).to(device)
+    model = build_model(
+        args.model,
+        args.weights,
+        sample_level=args.sample_level,
+        num_views=len(view_suffixes),
+        group_aggregation=args.group_aggregation,
+    ).to(device)
     if args.freeze_backbone_epochs > 0:
         set_backbone_trainable(model, args.model, trainable=False)
 
@@ -503,6 +611,11 @@ def evaluate_command(args: argparse.Namespace) -> None:
 
     model_name = checkpoint_args.get("model", args.model)
     image_size = int(checkpoint_args.get("image_size", args.image_size))
+    sample_level = checkpoint_args.get("sample_level", "image")
+    group_view_suffixes = parse_group_view_suffixes(
+        checkpoint_args.get("group_view_suffixes", ",".join(DEFAULT_GROUP_VIEW_SUFFIXES))
+    )
+    group_aggregation = checkpoint_args.get("group_aggregation", "concat")
     threshold = (
         float(args.threshold)
         if args.threshold is not None
@@ -528,7 +641,7 @@ def evaluate_command(args: argparse.Namespace) -> None:
     if frame.empty:
         raise ValueError(f"No rows found for split '{args.split}'.")
 
-    dataset = GlassBottleDataset(frame, build_transforms(image_size, augment=False))
+    dataset = make_dataset(frame, build_transforms(image_size, augment=False), sample_level)
     loader = DataLoader(
         dataset,
         batch_size=args.batch_size,
@@ -537,7 +650,13 @@ def evaluate_command(args: argparse.Namespace) -> None:
         pin_memory=device.type == "cuda",
     )
 
-    model = build_model(model_name, "none").to(device)
+    model = build_model(
+        model_name,
+        "none",
+        sample_level=sample_level,
+        num_views=len(group_view_suffixes),
+        group_aggregation=group_aggregation,
+    ).to(device)
     model.load_state_dict(checkpoint["model_state_dict"])
     criterion = nn.BCEWithLogitsLoss()
     loss, labels, probs = run_epoch(model, loader, criterion, device, optimizer=None)
@@ -562,35 +681,69 @@ def predict_command(args: argparse.Namespace) -> None:
     checkpoint_args = checkpoint.get("args", {})
     model_name = checkpoint_args.get("model", args.model)
     image_size = int(checkpoint_args.get("image_size", args.image_size))
+    sample_level = checkpoint_args.get("sample_level", "image")
+    group_view_suffixes = parse_group_view_suffixes(
+        checkpoint_args.get("group_view_suffixes", ",".join(DEFAULT_GROUP_VIEW_SUFFIXES))
+    )
+    group_aggregation = checkpoint_args.get("group_aggregation", "concat")
     threshold = (
         float(args.threshold)
         if args.threshold is not None
         else float(checkpoint.get("threshold", 0.5))
     )
 
-    model = build_model(model_name, "none").to(device)
+    model = build_model(
+        model_name,
+        "none",
+        sample_level=sample_level,
+        num_views=len(group_view_suffixes),
+        group_aggregation=group_aggregation,
+    ).to(device)
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
 
     transform = build_transforms(image_size, augment=False)
     rows = []
     with torch.no_grad():
-        for image_path in args.images:
-            path = Path(image_path)
-            with Image.open(path) as image:
-                image = image.convert("RGB")
-                tensor = transform(image).unsqueeze(0).to(device)
+        if sample_level == "group":
+            paths = order_group_paths([Path(path) for path in args.images], group_view_suffixes)
+            tensors = []
+            for path in paths:
+                with Image.open(path) as image:
+                    image = image.convert("RGB")
+                    tensors.append(transform(image))
+            tensor = torch.stack(tensors).unsqueeze(0).to(device)
             probability = torch.sigmoid(model(tensor)).item()
             label = "defective" if probability >= threshold else "good"
             rows.append(
                 {
-                    "path": str(path),
+                    "path": json.dumps([str(path) for path in paths]),
                     "defect_probability": probability,
                     "prediction": label,
                     "threshold": threshold,
                 }
             )
-            print(f"{path}: {label} (defect probability {probability:.4f})")
+            print(
+                f"{', '.join(str(path) for path in paths)}: "
+                f"{label} (defect probability {probability:.4f})"
+            )
+        else:
+            for image_path in args.images:
+                path = Path(image_path)
+                with Image.open(path) as image:
+                    image = image.convert("RGB")
+                    tensor = transform(image).unsqueeze(0).to(device)
+                probability = torch.sigmoid(model(tensor)).item()
+                label = "defective" if probability >= threshold else "good"
+                rows.append(
+                    {
+                        "path": str(path),
+                        "defect_probability": probability,
+                        "prediction": label,
+                        "threshold": threshold,
+                    }
+                )
+                print(f"{path}: {label} (defect probability {probability:.4f})")
 
     if args.output_csv:
         with open(args.output_csv, "w", newline="") as handle:
@@ -680,19 +833,59 @@ def auto_dirs(data_dir: Path, token: str) -> List[Path]:
     )
 
 
+def parse_group_view_suffixes(value: str) -> List[str]:
+    suffixes = [suffix.strip() for suffix in value.split(",") if suffix.strip()]
+    if not suffixes:
+        raise ValueError("--group-view-suffixes must contain at least one suffix.")
+    return suffixes
+
+
+def order_group_paths(paths: Sequence[Path], view_suffixes: Sequence[str]) -> List[Path]:
+    by_suffix: Dict[str, Path] = {}
+    for path in paths:
+        suffix = view_suffix(path)
+        if suffix in by_suffix:
+            raise ValueError(f"Duplicate image for grouped suffix '{suffix}': {path}")
+        by_suffix[suffix] = path
+
+    missing = [suffix for suffix in view_suffixes if suffix not in by_suffix]
+    extra = [str(path) for suffix, path in by_suffix.items() if suffix not in view_suffixes]
+    if missing:
+        raise ValueError(
+            "Grouped prediction is missing required suffixes: " + ", ".join(missing)
+        )
+    if extra:
+        raise ValueError(
+            "Grouped prediction received images outside --group-view-suffixes: "
+            + ", ".join(extra)
+        )
+    return [by_suffix[suffix] for suffix in view_suffixes]
+
+
+def bottle_prefix(path: Path) -> str:
+    return path.stem.split("_")[0]
+
+
+def view_suffix(path: Path) -> str:
+    parts = path.name.split("_", 1)
+    return parts[1] if len(parts) == 2 else path.name
+
+
 def scan_dataset(good_dirs: Sequence[Path], defect_dirs: Sequence[Path]) -> pd.DataFrame:
     records = []
     for label_name, directories in [("good", good_dirs), ("defective", defect_dirs)]:
         for directory in directories:
             for path in sorted(directory.iterdir()):
                 if path.is_file() and path.suffix.lower() in IMAGE_SUFFIXES:
-                    group_base = path.stem.split("_")[0]
+                    group_base = bottle_prefix(path)
                     records.append(
                         {
                             "path": str(path),
                             "label": CLASS_TO_IDX[label_name],
                             "label_name": label_name,
                             "group_id": f"{label_name}:{group_base}",
+                            "bottle_prefix": group_base,
+                            "view_suffix": view_suffix(path),
                             "source_dir": directory.name,
                         }
                     )
@@ -708,6 +901,79 @@ def scan_dataset(good_dirs: Sequence[Path], defect_dirs: Sequence[Path]) -> pd.D
     print("Dataset counts:")
     for label_name in ["good", "defective"]:
         print(f"  {label_name}: {counts.get(label_name, 0)}")
+    return frame
+
+
+def make_bottle_group_frame(
+    image_frame: pd.DataFrame, view_suffixes: Sequence[str]
+) -> pd.DataFrame:
+    expected = list(view_suffixes)
+    expected_set = set(expected)
+    eligible = image_frame[image_frame["view_suffix"].isin(expected_set)].copy()
+    ignored = len(image_frame) - len(eligible)
+    if eligible.empty:
+        raise ValueError(
+            "No images matched the grouped view suffixes: " + ", ".join(expected)
+        )
+
+    records = []
+    incomplete = 0
+    duplicate_groups: List[str] = []
+    for group_id, group_frame in eligible.groupby("group_id", sort=True):
+        by_suffix: Dict[str, List[pd.Series]] = defaultdict(list)
+        for _, row in group_frame.iterrows():
+            by_suffix[str(row["view_suffix"])].append(row)
+
+        missing = [suffix for suffix in expected if suffix not in by_suffix]
+        duplicate_suffixes = [
+            suffix for suffix, rows in by_suffix.items() if len(rows) > 1
+        ]
+        if duplicate_suffixes:
+            duplicate_groups.append(f"{group_id}: {duplicate_suffixes}")
+            continue
+        if missing:
+            incomplete += 1
+            continue
+
+        ordered_rows = [by_suffix[suffix][0] for suffix in expected]
+        label_values = {int(row["label"]) for row in ordered_rows}
+        if len(label_values) != 1:
+            raise ValueError(f"Grouped bottle has mixed labels: {group_id}")
+
+        paths = [str(row["path"]) for row in ordered_rows]
+        source_dirs = sorted({str(row["source_dir"]) for row in ordered_rows})
+        records.append(
+            {
+                "path": paths[0],
+                "paths_json": json.dumps(paths),
+                "label": int(ordered_rows[0]["label"]),
+                "label_name": str(ordered_rows[0]["label_name"]),
+                "group_id": group_id,
+                "bottle_prefix": str(ordered_rows[0]["bottle_prefix"]),
+                "view_suffixes": ",".join(expected),
+                "num_views": len(paths),
+                "source_dir": "+".join(source_dirs),
+            }
+        )
+
+    if duplicate_groups:
+        examples = "; ".join(duplicate_groups[:5])
+        raise ValueError(
+            "Some bottle prefixes have duplicate images for the same suffix. "
+            f"Examples: {examples}"
+        )
+
+    if not records:
+        raise ValueError("No complete grouped bottle samples were found.")
+
+    frame = pd.DataFrame(records)
+    counts = frame["label_name"].value_counts().to_dict()
+    print("Grouped bottle counts:")
+    for label_name in ["good", "defective"]:
+        print(f"  {label_name}: {counts.get(label_name, 0)}")
+    print(f"Grouped views: {', '.join(expected)}")
+    print(f"Ignored images with non-group suffixes: {ignored}")
+    print(f"Incomplete bottle groups skipped: {incomplete}")
     return frame
 
 
@@ -736,25 +1002,37 @@ def make_group_split(
 
     for label in sorted(frame["label"].unique()):
         class_frame = frame[frame["label"] == label]
-        grouped = [
-            (group_id, len(group_frame))
-            for group_id, group_frame in class_frame.groupby("group_id")
-        ]
-        rng.shuffle(grouped)
+        group_ids = list(class_frame["group_id"].drop_duplicates())
+        rng.shuffle(group_ids)
 
-        total = len(class_frame)
-        train_cut = train_ratio * total
-        val_cut = (train_ratio + val_ratio) * total
-        running = 0
-        for group_id, count in grouped:
-            if running < train_cut:
+        n_groups = len(group_ids)
+        if n_groups < 3:
+            raise ValueError(
+                "Each class needs at least 3 bottle groups to create "
+                "train/val/test splits."
+            )
+
+        n_train = max(1, int(round(train_ratio * n_groups)))
+        n_val = max(1, int(round(val_ratio * n_groups)))
+        if n_train + n_val >= n_groups:
+            n_val = max(1, n_groups - n_train - 1)
+        if n_train + n_val >= n_groups:
+            n_train = max(1, n_groups - n_val - 1)
+        n_test = n_groups - n_train - n_val
+        if n_test < 1:
+            raise ValueError(
+                "Could not allocate at least one group per split. "
+                f"Class {label} has {n_groups} groups."
+            )
+
+        for index, group_id in enumerate(group_ids):
+            if index < n_train:
                 split = "train"
-            elif running < val_cut:
+            elif index < n_train + n_val:
                 split = "val"
             else:
                 split = "test"
             assignments[group_id] = split
-            running += count
 
     result = frame.copy()
     result["split"] = result["group_id"].map(assignments)
@@ -835,14 +1113,15 @@ def make_dataloaders(
     balance_strategy: str,
     seed: int,
     device: torch.device,
+    sample_level: str,
 ) -> Tuple[DataLoader, DataLoader, DataLoader]:
     train_frame = frame[frame["split"] == "train"].reset_index(drop=True)
     val_frame = frame[frame["split"] == "val"].reset_index(drop=True)
     test_frame = frame[frame["split"] == "test"].reset_index(drop=True)
 
-    train_dataset = GlassBottleDataset(train_frame, train_transform)
-    val_dataset = GlassBottleDataset(val_frame, eval_transform)
-    test_dataset = GlassBottleDataset(test_frame, eval_transform)
+    train_dataset = make_dataset(train_frame, train_transform, sample_level)
+    val_dataset = make_dataset(val_frame, eval_transform, sample_level)
+    test_dataset = make_dataset(test_frame, eval_transform, sample_level)
 
     generator = torch.Generator()
     generator.manual_seed(seed)
@@ -871,6 +1150,16 @@ def make_dataloaders(
     return train_loader, val_loader, test_loader
 
 
+def make_dataset(
+    frame: pd.DataFrame, transform: transforms.Compose, sample_level: str
+) -> Dataset:
+    if sample_level == "group":
+        return GroupedBottleDataset(frame, transform)
+    if sample_level == "image":
+        return GlassBottleDataset(frame, transform)
+    raise ValueError(f"Unknown sample level: {sample_level}")
+
+
 def make_weighted_sampler(
     train_frame: pd.DataFrame, generator: torch.Generator
 ) -> WeightedRandomSampler:
@@ -884,21 +1173,53 @@ def make_weighted_sampler(
     )
 
 
-def build_model(model_name: str, weights_mode: str) -> nn.Module:
+def build_model(
+    model_name: str,
+    weights_mode: str,
+    sample_level: str = "image",
+    num_views: int = 1,
+    group_aggregation: str = "concat",
+) -> nn.Module:
     use_weights = weights_mode == "imagenet"
     try:
-        return _build_model(model_name, use_weights)
+        return _build_model(
+            model_name,
+            use_weights,
+            sample_level=sample_level,
+            num_views=num_views,
+            group_aggregation=group_aggregation,
+        )
     except Exception as exc:
         if use_weights:
             print(
                 "Could not load ImageNet weights. Falling back to random init. "
                 f"Reason: {exc}"
             )
-            return _build_model(model_name, False)
+            return _build_model(
+                model_name,
+                False,
+                sample_level=sample_level,
+                num_views=num_views,
+                group_aggregation=group_aggregation,
+            )
         raise
 
 
-def _build_model(model_name: str, use_weights: bool) -> nn.Module:
+def _build_model(
+    model_name: str,
+    use_weights: bool,
+    sample_level: str,
+    num_views: int,
+    group_aggregation: str,
+) -> nn.Module:
+    if sample_level == "group":
+        return _build_multiview_model(
+            model_name,
+            use_weights,
+            num_views=num_views,
+            aggregation=group_aggregation,
+        )
+
     if model_name == "efficientnet_b0":
         weights = EfficientNet_B0_Weights.DEFAULT if use_weights else None
         model = efficientnet_b0(weights=weights)
@@ -923,7 +1244,53 @@ def _build_model(model_name: str, use_weights: bool) -> nn.Module:
     raise ValueError(f"Unknown model: {model_name}")
 
 
+def _build_multiview_model(
+    model_name: str, use_weights: bool, num_views: int, aggregation: str
+) -> nn.Module:
+    if num_views < 1:
+        raise ValueError("Grouped bottle model needs at least one view.")
+
+    if model_name == "efficientnet_b0":
+        weights = EfficientNet_B0_Weights.DEFAULT if use_weights else None
+        model = efficientnet_b0(weights=weights)
+        feature_dim = model.classifier[1].in_features
+        backbone = nn.Sequential(model.features, model.avgpool, nn.Flatten())
+    elif model_name == "resnet18":
+        weights = ResNet18_Weights.DEFAULT if use_weights else None
+        model = resnet18(weights=weights)
+        feature_dim = model.fc.in_features
+        backbone = nn.Sequential(*list(model.children())[:-1], nn.Flatten())
+    elif model_name == "mobilenet_v3_small":
+        weights = MobileNet_V3_Small_Weights.DEFAULT if use_weights else None
+        model = mobilenet_v3_small(weights=weights)
+        feature_dim = model.classifier[-1].in_features
+        backbone = nn.Sequential(model.features, model.avgpool, nn.Flatten())
+    else:
+        raise ValueError(f"Unknown model: {model_name}")
+
+    classifier_input_dim = feature_dim * num_views if aggregation == "concat" else feature_dim
+    classifier = nn.Sequential(
+        nn.Dropout(p=0.30),
+        nn.Linear(classifier_input_dim, 1),
+    )
+    return MultiViewClassifier(
+        backbone=backbone,
+        feature_dim=feature_dim,
+        num_views=num_views,
+        aggregation=aggregation,
+        classifier=classifier,
+    )
+
+
 def set_backbone_trainable(model: nn.Module, model_name: str, trainable: bool) -> None:
+    if isinstance(model, MultiViewClassifier):
+        for parameter in model.parameters():
+            parameter.requires_grad = trainable
+        if not trainable:
+            for parameter in model.classifier.parameters():
+                parameter.requires_grad = True
+        return
+
     for parameter in model.parameters():
         parameter.requires_grad = trainable
 
@@ -1194,7 +1561,7 @@ def plot_dataset_distribution(frame: pd.DataFrame, run_dir: Path) -> None:
     ax = counts.plot(kind="bar", figsize=(8, 5), color=["#4c78a8", "#e45756"])
     ax.set_title("Class distribution by split")
     ax.set_xlabel("Split")
-    ax.set_ylabel("Images")
+    ax.set_ylabel("Samples")
     ax.legend(title="Class")
     ax.grid(axis="y", alpha=0.25)
     plt.tight_layout()
@@ -1205,9 +1572,9 @@ def plot_dataset_distribution(frame: pd.DataFrame, run_dir: Path) -> None:
         frame.groupby(["source_dir", "label_name"]).size().unstack(fill_value=0)
     )
     ax = source_counts.plot(kind="bar", figsize=(9, 5), color=["#4c78a8", "#e45756"])
-    ax.set_title("Images by source folder")
+    ax.set_title("Samples by source folder")
     ax.set_xlabel("Source folder")
-    ax.set_ylabel("Images")
+    ax.set_ylabel("Samples")
     ax.legend(title="Class")
     ax.grid(axis="y", alpha=0.25)
     plt.tight_layout()
@@ -1223,7 +1590,7 @@ def plot_augmentation_examples(
     if candidates.empty:
         return
 
-    path = Path(candidates.iloc[0]["path"])
+    path = first_sample_path(candidates.iloc[0])
     with Image.open(path) as image:
         image = image.convert("RGB")
         fig, axes = plt.subplots(2, 4, figsize=(10, 5))
@@ -1235,6 +1602,14 @@ def plot_augmentation_examples(
         plt.tight_layout()
         plt.savefig(run_dir / "augmentation_examples.png", dpi=160)
         plt.close()
+
+
+def first_sample_path(row: pd.Series) -> Path:
+    if "paths_json" in row and isinstance(row["paths_json"], str):
+        paths = json.loads(row["paths_json"])
+        if paths:
+            return Path(paths[0])
+    return Path(row["path"])
 
 
 def plot_training_curves(history: pd.DataFrame, run_dir: Path) -> None:
@@ -1381,8 +1756,8 @@ def plot_sample_predictions(
     axes_array = np.array(axes).reshape(-1)
 
     for axis, index in zip(axes_array, indices):
-        with Image.open(paths[index]) as image:
-            axis.imshow(image.convert("L"), cmap="gray")
+        image = make_prediction_preview(parse_identifier_paths(paths[index]))
+        axis.imshow(image, cmap="gray")
         true_name = IDX_TO_CLASS[int(labels[index])]
         pred_name = IDX_TO_CLASS[int(preds[index])]
         axis.set_title(
@@ -1397,6 +1772,38 @@ def plot_sample_predictions(
     plt.tight_layout()
     plt.savefig(path, dpi=160)
     plt.close()
+
+
+def parse_identifier_paths(identifier: str) -> List[Path]:
+    try:
+        parsed = json.loads(identifier)
+        if isinstance(parsed, list):
+            return [Path(path) for path in parsed]
+    except json.JSONDecodeError:
+        pass
+    return [Path(identifier)]
+
+
+def make_prediction_preview(paths: Sequence[Path]) -> Image.Image:
+    images = []
+    for path in paths:
+        with Image.open(path) as image:
+            preview = image.convert("L")
+            preview.thumbnail((180, 180))
+            images.append(preview.copy())
+
+    if len(images) == 1:
+        return images[0]
+
+    width = sum(image.width for image in images)
+    height = max(image.height for image in images)
+    canvas = Image.new("L", (width, height), 0)
+    offset = 0
+    for image in images:
+        top = (height - image.height) // 2
+        canvas.paste(image, (offset, top))
+        offset += image.width
+    return canvas
 
 
 def select_interesting_indices(

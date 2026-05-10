@@ -26,9 +26,9 @@ from PIL import Image
 
 IMAGE_SUFFIXES = {".bmp", ".png", ".jpg", ".jpeg", ".tif", ".tiff"}
 CROP_RULES: Dict[str, Tuple[int, int, int, int]] = {
-    "80_2_C.bmp": (0, 375, 600, 725),
-    "26_2_C.bmp": (0, 400, 600, 750),
-    "28_2_C.bmp": (0, 300, 600, 650),
+    "80_5_C.bmp": (0, 375, 600, 725),
+    "26_5_C.bmp": (0, 400, 600, 750),
+    "28_5_C.bmp": (0, 300, 600, 650),
 }
 
 
