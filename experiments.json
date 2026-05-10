@@ -1,0 +1,58 @@
+{
+  "description": "Hyperparameter experiments for glass bottle defect classification.",
+  "defaults": {
+    "epochs": 30,
+    "batch_size": 16,
+    "image_size": 384,
+    "weights": "imagenet",
+    "device": "auto",
+    "balance_strategy": "sampler",
+    "model_selection_metric": "auprc",
+    "freeze_backbone_epochs": 2,
+    "early_stopping_patience": 7,
+    "output_dir": "output/experiments"
+  },
+  "experiments": [
+    {
+      "name": "efficientnet_learning_rate",
+      "args": {
+        "model": "efficientnet_b0"
+      },
+      "grid": {
+        "learning_rate": [0.0001, 0.0003, 0.001]
+      }
+    },
+    {
+      "name": "efficientnet_resolution",
+      "args": {
+        "model": "efficientnet_b0",
+        "learning_rate": 0.0003
+      },
+      "grid": {
+        "image_size": [224, 384, 512],
+        "batch_size": [8, 16]
+      }
+    },
+    {
+      "name": "model_comparison",
+      "args": {
+        "learning_rate": 0.0003,
+        "image_size": 384
+      },
+      "grid": {
+        "model": ["efficientnet_b0", "resnet18", "mobilenet_v3_small"]
+      }
+    },
+    {
+      "name": "imbalance_strategy",
+      "args": {
+        "model": "efficientnet_b0",
+        "learning_rate": 0.0003,
+        "image_size": 384
+      },
+      "grid": {
+        "balance_strategy": ["sampler", "loss", "both"]
+      }
+    }
+  ]
+}
