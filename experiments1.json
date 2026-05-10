@@ -1,0 +1,54 @@
+{
+  "description": "Single experiment config with every training default declared explicitly and a 30% test split.",
+  "defaults": {
+    "data_dir": "data",
+    "good_dir": "FOTO TAGLIATE BUONE",
+    "defect_dir": "FOTO TAGLIATE SCARTI",
+    "output_dir": "output/experiments1",
+    "run_name": null,
+    "seed": 42,
+    "train_ratio": 0.70,
+    "val_ratio": 0.15,
+    "test_ratio": 0.15,
+    "model": "efficientnet_b0",
+    "weights": "imagenet",
+    "image_size": 384,
+    "epochs": 30,
+    "batch_size": 16,
+    "learning_rate": 0.0003,
+    "weight_decay": 0.0001,
+    "freeze_backbone_epochs": 2,
+    "early_stopping_patience": 7,
+    "balance_strategy": "sampler",
+    "threshold_policy": "f1",
+    "fixed_threshold": 0.5,
+    "model_selection_metric": "auprc",
+    "limit_images_per_class": null,
+    "no_augment": false,
+    "device": "auto",
+    "num_workers": 2
+  },
+  "experiments": [
+    {
+      "name": "cropped_images",
+      "args": {
+        "train_ratio": 0.65,
+        "val_ratio": 0.15,
+        "test_ratio": 0.20,
+        "model": "efficientnet_b0",
+        "learning_rate": 0.0003,
+        "epochs": 20,
+        "batch_size": 16,
+        "image_size": 384,
+        "limit_images_per_class": null,
+        "model_selection_metric": "auprc",
+        "num_workers": 2,
+        "seed": 42,
+        "threshold_policy": "f1",
+        "weight_decay": 0.0001,
+        "weights": "imagenet"
+      },
+      "grid": {}
+    }
+  ]
+}

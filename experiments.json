@@ -9,7 +9,7 @@
     "balance_strategy": "sampler",
     "model_selection_metric": "auprc",
     "freeze_backbone_epochs": 2,
-    "early_stopping_patience": 7,
+    "early_stopping_patience": 5,
     "output_dir": "output/experiments"
   },
   "experiments": [
